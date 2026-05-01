@@ -1,0 +1,17 @@
+# Generated database files
+heap.db
+wal.log
+
+# Node modules (if you add dependencies later)
+node_modules/
+package-lock.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
