@@ -8,7 +8,10 @@
       "Bash(curl -s -c cookies.txt -b cookies.txt http://localhost:3000/state)",
       "Bash(curl -s -c cookies.txt -b cookies.txt -X POST -H \"Content-Type: application/json\" -d '{\"sql\":\"INSERT {\\\\\"id\\\\\":1,\\\\\"name\\\\\":\\\\\"alice\\\\\"}\"}' http://localhost:3000/exec)",
       "Bash(curl -s -c cookies.txt -b cookies.txt -X POST -H \"Content-Type: application/json\" -d '{\"sql\":\"COMMIT\"}' http://localhost:3000/exec)",
-      "Bash(kill %1)"
+      "Bash(kill %1)",
+      "Bash(netstat -ano)",
+      "Bash(tasklist)",
+      "Bash(taskkill //F //PID 11240)"
     ]
   }
 }
