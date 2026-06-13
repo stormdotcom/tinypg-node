@@ -424,7 +424,20 @@ class Database {
   close() { this.buf.close(); this.wal.close(); }
 }
 
+// ── Exports ───────────────────────────────────────────────────────────────────
+// Expose the engine so cli.js and gui.js can drive it. Internals (scanPage,
+// isVisible, PAGE_SIZE) are also exported because the inspector commands
+// (SHOW PAGES, SHOW BUFFERS) need to peek at the raw byte layout.
+module.exports = {
+  Database, Txn, TxnMgr, WAL, BufferPool,
+  scanPage, isVisible, numTuples, freeOffset, freeSpace,
+  PAGE_SIZE, MAX_BUF_PAGES, DATA_FILE, WAL_FILE,
+};
+
 // ── Demo ──────────────────────────────────────────────────────────────────────
+// Only runs when invoked directly (node tinypg.js) — not when require()'d
+// from cli.js or gui.js.
+if (require.main !== module) return;
 (function demo() {
   // Clean slate — remove any files left from a previous run
   for (const f of [DATA_FILE, WAL_FILE]) if (fs.existsSync(f)) fs.unlinkSync(f);
