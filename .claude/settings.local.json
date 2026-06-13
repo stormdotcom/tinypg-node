@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"const p = require\\('./parser.js'\\); console.log\\(JSON.stringify\\(p.parse\\('INSERT {\\\\\"id\\\\\":1}'\\)\\)\\); console.log\\(JSON.stringify\\(p.parse\\('SELECT WHERE id = 1'\\)\\)\\); console.log\\(JSON.stringify\\(p.parse\\('DELETE WHERE name = \\\\\"alice\\\\\"'\\)\\)\\); console.log\\(JSON.stringify\\(p.parse\\('SHOW WAL'\\)\\)\\);\")",
+      "Bash(node -e ' *)",
+      "Bash(node *)",
+      "Bash(curl -s -o /dev/null -w \"GET /:        %{http_code}\\\\n\" http://localhost:3000/)",
+      "Bash(curl -s -c cookies.txt -b cookies.txt http://localhost:3000/state)",
+      "Bash(curl -s -c cookies.txt -b cookies.txt -X POST -H \"Content-Type: application/json\" -d '{\"sql\":\"INSERT {\\\\\"id\\\\\":1,\\\\\"name\\\\\":\\\\\"alice\\\\\"}\"}' http://localhost:3000/exec)",
+      "Bash(curl -s -c cookies.txt -b cookies.txt -X POST -H \"Content-Type: application/json\" -d '{\"sql\":\"COMMIT\"}' http://localhost:3000/exec)",
+      "Bash(kill %1)"
+    ]
+  }
+}
