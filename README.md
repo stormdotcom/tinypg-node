@@ -1,16 +1,30 @@
 # TinyPG — Educational PostgreSQL Database Engine
 
-A ~300-line Node.js implementation of a miniature relational database that demonstrates the core internals of PostgreSQL. Learn how real databases manage transactions, consistency, and durability.
+A small Node.js implementation of a miniature relational database that demonstrates the core internals of PostgreSQL. Ships with an interactive shell *and* a browser-based explorer so you can watch every byte of state change as you type.
 
 ## What is TinyPG?
 
-TinyPG is an educational project that builds a simplified but feature-complete database engine mirroring PostgreSQL's architecture. It demonstrates fundamental concepts that make PostgreSQL (and most production databases) work correctly:
+TinyPG is an educational project that builds a simplified but feature-complete database engine mirroring PostgreSQL's architecture. It demonstrates the fundamental concepts that make PostgreSQL (and most production databases) work correctly:
 
 - **MVCC (Multi-Version Concurrency Control)** — Multiple transactions see different versions of the same row without locks
 - **WAL (Write-Ahead Logging)** — Durability guarantee: changes are logged before written to disk
 - **Crash Recovery** — Automatic replay of the write-ahead log to restore committed state
 - **Buffer Management** — In-memory page cache with LRU eviction
 - **Transaction Isolation** — READ COMMITTED semantics with snapshot-based visibility
+- **Multi-Table Catalog** — Named tables with `CREATE TABLE` / `DROP TABLE`, persisted via WAL
+- **Hash Indexes** — `CREATE INDEX name ON table(field)` with a runtime planner that picks index lookup vs. sequential scan and reports which it used
+
+## What's new — Tables + Indexes (June 2026)
+
+Earlier versions of TinyPG had a single implicit heap. The engine now has a real **catalog**:
+
+- **`CREATE TABLE users`** allocates a named table. Each table owns its own list of heap pages — inserting into `users` never collides with another table's pages.
+- **`CREATE INDEX idx_users_id ON users(id)`** builds an in-memory hash index from `field-value → list of (page id, page offset)`. A subsequent `SELECT * FROM users WHERE id = 5` skips the sequential scan and jumps straight to the row.
+- **DDL is WAL-persisted.** `CREATE_TABLE`, `DROP_TABLE`, `CREATE_INDEX`, `DROP_INDEX` records are written and fsync'd. On restart, recovery replays them in order and (for indexes) rescans the heap to repopulate index entries — so after a crash your schema and indexes are restored along with your committed rows.
+- **The planner is visible.** Every `SELECT WHERE` reports its plan — `index idx_users_id` or `seq scan (3 pages)` — in both the CLI (`-- plan: …`) and the GUI (a coloured badge under the result). You can watch the planner pick a different strategy the moment you add or drop an index.
+- **Backwards compatible.** A default table called **`main`** is auto-created on every database boot, so the original `INSERT {...}` / `SELECT` / `DELETE WHERE …` flows (without `INTO/FROM`) still work — they target `main`.
+
+This makes TinyPG concretely demonstrate the *query planning* concern, not just storage and concurrency. Toggle an index on and off and see the cost change in front of you.
 
 ## Architecture Overview
 
@@ -21,15 +35,18 @@ TinyPG is an educational project that builds a simplified but feature-complete d
 | **WAL** | `pg_wal/` | Write-ahead log for durability; all mutations logged before applying |
 | **BufferPool** | `shared_buffers` | Fixed-size in-memory cache of heap pages with LRU eviction |
 | **Heap Pages** | Relation heap files | Stored tuples with MVCC metadata (xmin/xmax) |
+| **Catalog** | `pg_class`, `pg_index` | In-memory registry of tables and indexes, persisted via WAL DDL records |
+| **Index (hash)** | `pg_index` + B-tree files | `Map<value, [{pid, off}]>` — fast equality lookup, no range scan |
 | **TxnMgr** | procarray + CLOG | Tracks running transactions and committed state |
-| **Txn** | Transaction context | Provides `insert()`, `select()`, `delete()`, `commit()` API |
+| **Txn** | Transaction context | Provides `insert()`, `select()`, `delete()`, `lookup()`, `commit()` API |
 
 ### How It Works
 
-1. **Insert**: Write-Ahead Log → Buffer Pool → Mark dirty → Commit flushes
-2. **Select**: Take snapshot of committed transactions → Scan pages → Filter by visibility
-3. **Delete**: Mark tuples with xmax (logical delete) → Old version stays for MVCC readers
-4. **Crash Recovery**: Replay WAL, only redo tuples from committed transactions
+1. **Insert**: Write-Ahead Log → find a page belonging to *this table* → Buffer Pool → mark dirty → update any indexes on this table → Commit flushes
+2. **Select / Lookup**: Take snapshot of committed transactions → if an index covers the predicate, use it; else scan all pages owned by the table → filter by MVCC visibility
+3. **Delete**: Mark tuples with xmax (logical delete) → Old version stays for MVCC readers (index still points at it; visibility filter discards it)
+4. **DDL** (CREATE/DROP TABLE/INDEX): Write a single WAL record, fsync immediately (auto-commit) → update catalog in memory
+5. **Crash Recovery**: Replay WAL — DDL records rebuild the catalog; INSERTs from committed transactions are re-applied; index backfill happens as inserts replay
 
 ## Getting Started
 
@@ -59,11 +76,13 @@ Both launchers check for Node.js and tell you how to install it if it's missing.
 
 `node gui.js` (or double-clicking `TinyPG-GUI.bat`) brings up a single page split into two columns:
 
-**Left** — query input and result output.
-**Right** — four live panels that refresh after every command:
+**Left** — query input, result output, and a query-plan badge that shows whether the last `SELECT WHERE` used an index or a sequential scan.
+**Right** — six live panels that refresh after every command:
 
-- **Heap Pages** — every tuple on every page, with `xmin` / `xmax` shown. Deleted (`xmax != 0`) tuples are struck through but stay visible, so you can see MVCC keeping old versions.
-- **WAL** — every write-ahead-log record with its LSN, type, and txid.
+- **Tables** — every table with its page list and live row count
+- **Indexes** — every index with table, indexed field, and number of entries
+- **Heap Pages** — every tuple on every page, labelled with the owning table, showing `xmin` / `xmax`. Deleted (`xmax != 0`) tuples are struck through but stay visible — that's MVCC keeping old versions.
+- **WAL** — every write-ahead-log record (BEGIN / INSERT / DELETE / COMMIT / CREATE_TABLE / CREATE_INDEX / …) with its LSN, type, and txid.
 - **Buffer Pool** — which pages are cached and which are dirty.
 - **Transactions** — active txids, committed txids, next txid to be issued.
 
@@ -94,14 +113,47 @@ bye.
 Commands accepted in both CLI and GUI:
 
 ```sql
+-- Transaction control
 BEGIN | COMMIT | ROLLBACK
-INSERT <json-object>          -- e.g. INSERT {"id": 1, "name": "alice"}
-SELECT [WHERE field=value]
-DELETE WHERE field=value
-SHOW WAL | SHOW PAGES | SHOW BUFFERS | SHOW TXNS
+
+-- Schema (DDL — auto-commit, persisted to WAL)
+CREATE TABLE <name>
+DROP   TABLE <name>
+CREATE INDEX <name> ON <table>(<field>)
+DROP   INDEX <name>
+
+-- Data (DML — runs inside the current transaction, auto-starts one if needed)
+INSERT [INTO <table> [VALUES]] <json-object>
+SELECT [* FROM <table>] [WHERE <field> = <value>]
+DELETE [FROM <table>] WHERE <field> = <value>
+
+-- Inspection — every SHOW target also has a live panel in the GUI
+SHOW TABLES | SHOW INDEXES | SHOW WAL | SHOW PAGES | SHOW BUFFERS | SHOW TXNS
 ```
 
-SQL-flavored aliases also work: `SELECT * FROM heap`, `INSERT INTO heap VALUES {...}`, `DELETE FROM heap WHERE ...`.
+When you omit `INTO <table>` / `FROM <table>`, commands target the default `main` table (auto-created on first boot).
+
+Every `SELECT` with a `WHERE` clause emits a plan line:
+- `-- plan: index idx_users_id on users` — used a hash index, O(1) lookup
+- `-- plan: seq scan (3 pages) on users` — no index covered this predicate, fell back to sequential scan
+
+This is TinyPG's `EXPLAIN`. Drop the index and re-run the same SELECT to watch it switch.
+
+### Worked example (paste into either CLI or GUI)
+
+```sql
+CREATE TABLE users
+CREATE INDEX idx_uid ON users(id)
+BEGIN
+INSERT INTO users {"id": 1, "name": "alice"}
+INSERT INTO users {"id": 2, "name": "bob"}
+INSERT INTO users {"id": 3, "name": "carol"}
+COMMIT
+SELECT * FROM users WHERE id = 2          -- plan: index idx_uid
+SELECT * FROM users WHERE name = "alice"  -- plan: seq scan (no index on name)
+DELETE FROM users WHERE id = 1
+SHOW PAGES                                -- alice's row is still there with xmax set
+```
 
 ### The built-in demo
 
