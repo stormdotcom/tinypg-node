@@ -31,19 +31,105 @@ TinyPG is an educational project that builds a simplified but feature-complete d
 3. **Delete**: Mark tuples with xmax (logical delete) → Old version stays for MVCC readers
 4. **Crash Recovery**: Replay WAL, only redo tuples from committed transactions
 
-## Running the Demo
+## Getting Started
+
+### Prerequisites
+
+- **Node.js 14+** — install from [nodejs.org](https://nodejs.org/). No `npm install` needed; TinyPG has zero dependencies.
+- Clone or download this folder. The first run creates `heap.db` and `wal.log` in the project directory.
+
+### Three ways to use TinyPG
+
+| Mode | Command | What you get |
+|------|---------|--------------|
+| **Demo** | `node tinypg.js` | Scripted 5-scene tour of MVCC + crash recovery |
+| **CLI shell** | `node cli.js` | Interactive REPL (like `psql`) |
+| **GUI explorer** | `node gui.js` then open <http://localhost:3000> | Browser UI (like a tiny pgAdmin) |
+
+### Windows: double-click launchers
+
+If you're on Windows you can skip the terminal entirely:
+
+- **`TinyPG-GUI.bat`** — starts the GUI server *and* opens your default browser at `http://localhost:3000`
+- **`TinyPG-CLI.bat`** — opens the interactive shell
+
+Both launchers check for Node.js and tell you how to install it if it's missing. Close the console window (or press `Ctrl+C`) to stop the server cleanly — that flushes the buffer pool to disk.
+
+### GUI walkthrough
+
+`node gui.js` (or double-clicking `TinyPG-GUI.bat`) brings up a single page split into two columns:
+
+**Left** — query input and result output.
+**Right** — four live panels that refresh after every command:
+
+- **Heap Pages** — every tuple on every page, with `xmin` / `xmax` shown. Deleted (`xmax != 0`) tuples are struck through but stay visible, so you can see MVCC keeping old versions.
+- **WAL** — every write-ahead-log record with its LSN, type, and txid.
+- **Buffer Pool** — which pages are cached and which are dirty.
+- **Transactions** — active txids, committed txids, next txid to be issued.
+
+Open the page in **two browser windows** to demo MVCC: each tab gets its own session and its own transaction, so you can `BEGIN + INSERT` in one window and watch the other see nothing until you `COMMIT`.
+
+### CLI walkthrough
+
+```text
+$ node cli.js
+TinyPG shell — type .help for commands, .exit to quit.
+tinypg> BEGIN
+  BEGIN  (tx1)
+tinypg> INSERT {"id": 1, "name": "alice"}
+  INSERT 1  (tx1)
+tinypg> COMMIT
+  COMMIT (tx1)
+tinypg> SELECT
+  {"id":1,"name":"alice"}
+  (1 row)
+tinypg> SHOW WAL
+  lsn=1  BEGIN    txid=1
+  lsn=2  INSERT   txid=1  data={"id":1,"name":"alice"}
+  lsn=3  COMMIT   txid=1
+tinypg> .exit
+bye.
+```
+
+Commands accepted in both CLI and GUI:
+
+```sql
+BEGIN | COMMIT | ROLLBACK
+INSERT <json-object>          -- e.g. INSERT {"id": 1, "name": "alice"}
+SELECT [WHERE field=value]
+DELETE WHERE field=value
+SHOW WAL | SHOW PAGES | SHOW BUFFERS | SHOW TXNS
+```
+
+SQL-flavored aliases also work: `SELECT * FROM heap`, `INSERT INTO heap VALUES {...}`, `DELETE FROM heap WHERE ...`.
+
+### The built-in demo
 
 ```bash
 node tinypg.js
 ```
 
-The script runs an integrated demo showing:
+Runs a scripted 5-scene tour with no interaction:
 
 1. **Scene 1**: Insert 5 rows in Transaction A (not yet committed)
 2. **Scene 2**: Show MVCC — Transaction B sees nothing until A commits
 3. **Scene 3**: Commit A; Transaction B takes fresh snapshot and sees the rows
 4. **Scene 4**: Simulate crash — Transaction C inserts but process dies mid-transaction
 5. **Scene 5**: Restart database — WAL recovery only restores committed rows
+
+### Resetting state
+
+The database persists across runs. To wipe it and start fresh, delete `heap.db` and `wal.log` from the project directory:
+
+```bash
+# bash
+rm -f heap.db wal.log
+
+# Windows cmd
+del heap.db wal.log
+```
+
+Both files are gitignored, so they won't end up in commits.
 
 ### Expected Output
 
