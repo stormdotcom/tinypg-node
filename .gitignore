@@ -2,6 +2,9 @@
 heap.db
 wal.log
 
+# Personal notes
+simple.md
+
 # Node modules (if you add dependencies later)
 node_modules/
 package-lock.json
