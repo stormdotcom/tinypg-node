@@ -278,6 +278,15 @@ class TxnMgr {
 }
 
 // ── Transaction ───────────────────────────────────────────────────────────────
+// All data operations are scoped to a table. To keep the original demo working
+// without changes, every method accepts a legacy signature that defaults to the
+// auto-created 'main' table:
+//   txn.insert(row)              → insert('main', row)
+//   txn.select(pred?)            → select('main', pred?)
+//   txn.delete(pred)             → delete('main', pred)
+// The "real" signatures take an explicit table name as the first argument.
+
+const DEFAULT_TABLE = 'main';
 
 class Txn {
   constructor(id, mgr, db) {
@@ -290,24 +299,34 @@ class Txn {
   // heap_insert() — WAL record first, then mutate the buffer pool page.
   // The WAL-before-page rule: if we crash after the WAL write but before the
   // page hits disk, recovery can redo the insert from the WAL record.
-  insert(row) {
+  insert(tableOrRow, maybeRow) {
     if (this.done) throw new Error('transaction has ended');
+    const [table, row] = typeof tableOrRow === 'string'
+      ? [tableOrRow, maybeRow]
+      : [DEFAULT_TABLE, tableOrRow];
+    if (!this.db.tables.has(table)) throw new Error(`no such table: ${table}`);
     const data = JSON.stringify(row);
-    this.db.wal.write({ type: 'INSERT', txid: this.id, data }); // WAL FIRST
-    const pid  = this.db._findPage(data);
+    this.db.wal.write({ type: 'INSERT', txid: this.id, table, data }); // WAL FIRST
+    const pid  = this.db._findPageForTable(table, data);
     const page = this.db.buf.fetch(pid);
-    appendTuple(page, this.id, 0, data); // xmax=0 means alive
+    const off  = appendTuple(page, this.id, 0, data); // xmax=0 means alive
     this.db.buf.dirty(pid);
+    this.db._indexInsert(table, row, pid, off);
   }
 
-  // SeqScan executor node — full sequential scan of every heap page.
+  // SeqScan executor node — sequential scan over the table's pages only.
   // Applies MVCC filter using a fresh snapshot (READ COMMITTED semantics:
   // each statement sees all commits that happened before it started).
-  select(pred) {
+  select(tableOrPred, maybePred) {
     if (this.done) throw new Error('transaction has ended');
+    const [table, pred] = typeof tableOrPred === 'string'
+      ? [tableOrPred, maybePred]
+      : [DEFAULT_TABLE, tableOrPred];
+    const t = this.db.tables.get(table);
+    if (!t) throw new Error(`no such table: ${table}`);
     const snap = this.mgr.snapshot(this.id); // GetSnapshotData()
     const rows = [];
-    for (let pid = 1; pid < this.db.nextPid; pid++) { // skip page 0 (catalog)
+    for (const pid of t.pages) {
       scanPage(this.db.buf.fetch(pid), (xmin, xmax, data) => {
         if (isVisible(xmin, xmax, snap)) {
           const row = JSON.parse(data);
@@ -318,16 +337,51 @@ class Txn {
     return rows;
   }
 
+  // Lookup with optional index acceleration. Returns { rows, plan } where
+  // plan is { type: 'index', name } or { type: 'seq', pagesScanned }.
+  // This is what the parser uses for "WHERE field = value" so we can show
+  // students whether an index was used (the "explain" of TinyPG).
+  lookup(table, field, value) {
+    if (this.done) throw new Error('transaction has ended');
+    const t = this.db.tables.get(table);
+    if (!t) throw new Error(`no such table: ${table}`);
+    const snap = this.mgr.snapshot(this.id);
+    const idx = this.db._findIndexFor(table, field);
+    if (idx) {
+      const locs = idx.entries.get(value) || [];
+      const rows = [];
+      for (const { pid, off } of locs) {
+        const page = this.db.buf.fetch(pid);
+        const xmin = page.readUInt32BE(off + 4);
+        const xmax = page.readUInt32BE(off + 8);
+        if (isVisible(xmin, xmax, snap)) {
+          const dataLen = page.readUInt32BE(off + 12);
+          const data = page.slice(off + 16, off + 16 + dataLen).toString('utf8');
+          rows.push(JSON.parse(data));
+        }
+      }
+      return { rows, plan: { type: 'index', name: idx.name } };
+    }
+    // No index — fall back to seq scan with the predicate.
+    const rows = this.select(table, r => r[field] === value || String(r[field]) === String(value));
+    return { rows, plan: { type: 'seq', pagesScanned: t.pages.length } };
+  }
+
   // heap_delete() — mark matching tuples with xmax = our txid.
   // The old version stays on disk so concurrent MVCC readers can still see it.
-  delete(pred) {
+  delete(tableOrPred, maybePred) {
     if (this.done) throw new Error('transaction has ended');
+    const [table, pred] = typeof tableOrPred === 'string'
+      ? [tableOrPred, maybePred]
+      : [DEFAULT_TABLE, tableOrPred];
+    const t = this.db.tables.get(table);
+    if (!t) throw new Error(`no such table: ${table}`);
     const snap = this.mgr.snapshot(this.id);
-    for (let pid = 1; pid < this.db.nextPid; pid++) {
+    for (const pid of t.pages) {
       const page = this.db.buf.fetch(pid);
       scanPage(page, (xmin, xmax, data, off) => {
         if (isVisible(xmin, xmax, snap) && pred(JSON.parse(data))) {
-          this.db.wal.write({ type: 'DELETE', txid: this.id, pid, off }); // WAL FIRST
+          this.db.wal.write({ type: 'DELETE', txid: this.id, table, pid, off }); // WAL FIRST
           setXmax(page, off, this.id);
           this.db.buf.dirty(pid);
         }
@@ -356,6 +410,14 @@ class Txn {
 }
 
 // ── Database ──────────────────────────────────────────────────────────────────
+// Adds a *catalog* on top of the heap: a registry of tables (name → list of
+// pages owned) and indexes (name → table + field + in-memory hash entries).
+//
+// In real Postgres the catalog is itself a set of regular tables (pg_class,
+// pg_attribute, pg_index, …) stored in the same heap format and protected by
+// the same MVCC + WAL machinery. We take a shortcut and keep the catalog in
+// memory, persisting only the DDL operations to the WAL so we can rebuild
+// the catalog on restart.
 
 class Database {
   constructor(dir = '.') {
@@ -363,56 +425,193 @@ class Database {
     this.wal     = new WAL(path.join(dir, WAL_FILE));
     this.txnMgr  = new TxnMgr();
     this.nextPid = 1; // heap starts at page 1; page 0 is the catalog
-    this._recover();  // replay WAL before accepting any connections — like pg's startup process
+
+    // ── Catalog ─────────────────────────────────────────────────────────
+    // tables:  name → { pages: number[] }      (which pages hold this table's tuples)
+    // indexes: name → { name, table, field, entries: Map<value, Array<{pid,off}>> }
+    // The index value→locations map is rebuilt from a heap scan during recovery
+    // and kept up-to-date on every insert. Deletes are not propagated to the
+    // index — instead the lookup re-checks isVisible() and filters dead hits.
+    this.tables  = new Map();
+    this.indexes = new Map();
+
+    this._recover();
+
+    // Always provide a default 'main' table so callers can do
+    // `txn.insert(row)` without a CREATE TABLE first — matches the original demo.
+    if (!this.tables.has(DEFAULT_TABLE)) this._createTable(DEFAULT_TABLE);
+  }
+
+  // ── DDL ─────────────────────────────────────────────────────────────────
+  // DDL is auto-commit: each call writes a single WAL record and fsyncs.
+  // Postgres has transactional DDL (CREATE TABLE inside BEGIN/ROLLBACK
+  // actually rolls back); we don't bother — schema changes are immediate.
+
+  createTable(name) {
+    if (this.tables.has(name)) throw new Error(`table already exists: ${name}`);
+    this.wal.write({ type: 'CREATE_TABLE', name });
+    this.wal.flush();
+    this._createTable(name);
+  }
+  _createTable(name) { this.tables.set(name, { pages: [] }); }
+
+  dropTable(name) {
+    if (name === DEFAULT_TABLE) throw new Error(`cannot drop the default '${DEFAULT_TABLE}' table`);
+    if (!this.tables.has(name)) throw new Error(`no such table: ${name}`);
+    this.wal.write({ type: 'DROP_TABLE', name });
+    this.wal.flush();
+    this._dropTable(name);
+  }
+  _dropTable(name) {
+    // Pages aren't reclaimed (no VACUUM here) — they become orphaned in heap.db.
+    this.tables.delete(name);
+    // Cascade-drop any indexes that referenced this table.
+    for (const [iname, idx] of this.indexes) {
+      if (idx.table === name) this.indexes.delete(iname);
+    }
+  }
+
+  createIndex(name, table, field) {
+    if (!this.tables.has(table)) throw new Error(`no such table: ${table}`);
+    if (this.indexes.has(name))  throw new Error(`index already exists: ${name}`);
+    this.wal.write({ type: 'CREATE_INDEX', name, table, field });
+    this.wal.flush();
+    this._createIndex(name, table, field);
+  }
+  _createIndex(name, table, field) {
+    const idx = { name, table, field, entries: new Map() };
+    this.indexes.set(name, idx);
+    // Backfill from existing rows. During WAL recovery the table may be empty
+    // at this point (rows come later) — that's fine, future INSERT replay will
+    // call _indexInsert and populate them.
+    const t = this.tables.get(table);
+    if (t) {
+      for (const pid of t.pages) {
+        scanPage(this.buf.fetch(pid), (xmin, xmax, data, off) => {
+          let row; try { row = JSON.parse(data); } catch { return; }
+          if (field in row) this._addIndexEntry(idx, row[field], pid, off);
+        });
+      }
+    }
+  }
+
+  dropIndex(name) {
+    if (!this.indexes.has(name)) throw new Error(`no such index: ${name}`);
+    this.wal.write({ type: 'DROP_INDEX', name });
+    this.wal.flush();
+    this.indexes.delete(name);
+  }
+
+  _addIndexEntry(idx, value, pid, off) {
+    if (!idx.entries.has(value)) idx.entries.set(value, []);
+    idx.entries.get(value).push({ pid, off });
+  }
+
+  // Called from Txn.insert after appendTuple — keep all matching indexes
+  // up to date. Cheap: O(number of indexes on this table).
+  _indexInsert(table, row, pid, off) {
+    for (const idx of this.indexes.values()) {
+      if (idx.table === table && idx.field in row) {
+        this._addIndexEntry(idx, row[idx.field], pid, off);
+      }
+    }
+  }
+
+  // First index that matches (table, field) — query planner uses this to
+  // decide between an index lookup and a seq scan.
+  _findIndexFor(table, field) {
+    for (const idx of this.indexes.values()) {
+      if (idx.table === table && idx.field === field) return idx;
+    }
+    return null;
   }
 
   // StartupXLOG() redo phase — replay WAL records to reconstruct committed state.
   //
   // pg's startup process reads from the last checkpoint LSN forward.
   // We have no checkpoints, so we always replay the entire WAL — fine for a demo.
-  // The two-pass approach mirrors pg: first find what committed, then redo their work.
+  // The two-pass approach mirrors pg: first find what committed, then redo.
   _recover() {
     const recs = this.wal.readAll();
     if (recs.length === 0) return; // fresh database — nothing to recover
 
     // Pass 1: rebuild committed set and highest txid seen.
-    // This is like pg reading pg_xact (CLOG) pages to know which txids committed.
     let maxTxid = 0;
     for (const r of recs) {
       if (r.type === 'COMMIT') this.txnMgr.committed.add(r.txid);
-      if (r.txid > maxTxid)   maxTxid = r.txid;
+      if (r.txid && r.txid > maxTxid) maxTxid = r.txid;
     }
     this.txnMgr.nextId = maxTxid + 1; // don't reuse txids — they live in old tuples
 
-    // Pass 2: redo all committed inserts from WAL.
-    // We truncate the heap back to just the catalog page, then replay, so the
-    // heap file is in a consistent state regardless of what hit disk before the crash.
-    // Uncommitted inserts are simply never replayed — their tuples don't reappear.
-    this.buf.reset(); // truncate heap to catalog page only
+    // Pass 2: wipe heap, then replay DDL + committed INSERTs in WAL order.
+    // Schema changes (CREATE/DROP TABLE/INDEX) always replay — they're auto-commit.
+    // Data changes (INSERT) replay only if their txid committed.
+    // DELETEs are not replayed: the rebuild starts from an empty heap so
+    // there's nothing to delete — but this means a committed insert+delete
+    // within one transaction will resurrect the row. (Known limitation, same
+    // as the pre-tables version.)
+    this.buf.reset();
     for (const r of recs) {
-      if (r.type === 'INSERT' && this.txnMgr.committed.has(r.txid)) {
-        const pid  = this._findPage(r.data);
-        const page = this.buf.fetch(pid);
-        appendTuple(page, r.txid, 0, r.data);
-        this.buf.dirty(pid);
+      switch (r.type) {
+        case 'CREATE_TABLE':  this._createTable(r.name); break;
+        case 'DROP_TABLE':    this._dropTable(r.name);   break;
+        case 'CREATE_INDEX':  this._createIndex(r.name, r.table, r.field); break;
+        case 'DROP_INDEX':    this.indexes.delete(r.name); break;
+        case 'INSERT': {
+          if (!this.txnMgr.committed.has(r.txid)) break;
+          const table = r.table || DEFAULT_TABLE;
+          // Tolerate old WAL records that predate tables — funnel them into 'main'.
+          if (!this.tables.has(table)) this._createTable(table);
+          const pid  = this._findPageForTable(table, r.data);
+          const page = this.buf.fetch(pid);
+          const off  = appendTuple(page, r.txid, 0, r.data);
+          this.buf.dirty(pid);
+          let row; try { row = JSON.parse(r.data); } catch { row = null; }
+          if (row) this._indexInsert(table, row, pid, off);
+          break;
+        }
       }
     }
     this.buf.checkpoint(); // flush recovered pages to disk
     console.log(`  [WAL recovery] replayed ${recs.length} records — ` +
                 `restored ${this.txnMgr.committed.size} committed txn(s), ` +
-                `skipped all uncommitted`);
+                `${this.tables.size} table(s), ${this.indexes.size} index(es)`);
   }
 
-  // RelationGetBufferForTuple() + FSM (Free Space Map) lookup.
-  // pg maintains a dedicated FSM fork per relation to quickly find pages
-  // with enough free space.  We do a simple linear scan — O(n) but readable.
-  _findPage(dataStr) {
+  // RelationGetBufferForTuple() + FSM (Free Space Map) lookup, scoped to one
+  // table. Pages owned by other tables are not considered — that's how
+  // multi-table storage works without per-page table tags.
+  _findPageForTable(table, dataStr) {
+    const t = this.tables.get(table);
+    if (!t) throw new Error(`no such table: ${table}`);
     const needed = TUPLE_HDR_SZ + Buffer.byteLength(dataStr, 'utf8');
-    for (let pid = 1; pid < this.nextPid; pid++) {
+    for (const pid of t.pages) {
       if (freeSpace(this.buf.fetch(pid)) >= needed) return pid;
     }
-    // No page has room — extend the relation (smgrextend)
-    return this.nextPid++;
+    // Extend: allocate a fresh page and assign it to this table.
+    const pid = this.nextPid++;
+    t.pages.push(pid);
+    return pid;
+  }
+
+  // ── Inspection helpers used by the CLI/GUI ─────────────────────────────
+  listTables() {
+    const out = [];
+    for (const [name, t] of this.tables) {
+      let rowCount = 0;
+      for (const pid of t.pages) rowCount += numTuples(this.buf.fetch(pid));
+      out.push({ name, pages: [...t.pages], rowCount });
+    }
+    return out;
+  }
+  listIndexes() {
+    const out = [];
+    for (const [name, idx] of this.indexes) {
+      let entryCount = 0;
+      for (const arr of idx.entries.values()) entryCount += arr.length;
+      out.push({ name, table: idx.table, field: idx.field, entryCount });
+    }
+    return out;
   }
 
   begin() {
