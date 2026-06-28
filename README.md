@@ -14,7 +14,7 @@ TinyPG is an educational project that builds a simplified but feature-complete d
 - **Multi-Table Catalog** — Named tables with `CREATE TABLE` / `DROP TABLE`, persisted via WAL
 - **Hash Indexes** — `CREATE INDEX name ON table(field)` with a runtime planner that picks index lookup vs. sequential scan and reports which it used
 
-## What's new — Tables + Indexes (June 2026)
+## What's new — Tables + Indexes 
 
 Earlier versions of TinyPG had a single implicit heap. The engine now has a real **catalog**:
 
